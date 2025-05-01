@@ -2,7 +2,7 @@ FROM golang:1.23-alpine AS builder
 
 WORKDIR /app
 
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 RUN go mod verify
 
@@ -16,7 +16,7 @@ RUN apk --no-cache add ca-certificates
 
 COPY --from=builder /radicale-controller /usr/local/bin/radicale-controller
 
-ENV POLL_INTERVAL="5m"
+ENV POLL_INTERVAL="1m"
 ENV RIGHTS_FILE_PATH="/data/rights"
 ENV RADICALE_STORAGE_PATH="/data/collections/collection-root"
 ENV HTTP_METHOD="GET"

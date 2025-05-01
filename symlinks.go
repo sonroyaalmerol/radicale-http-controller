@@ -7,13 +7,162 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+
+	"github.com/fsnotify/fsnotify"
 )
 
-func manageSymlinks(desiredSymlinks []Symlink, storagePath string) error {
+var (
+	watcher           *fsnotify.Watcher
+	watcherMutex      sync.Mutex
+	watcherSetup      sync.Once
+	lastKnownConfig   *ControllerConfig
+	lastKnownSymlinks []Symlink
+)
+
+func setupWatcher(cfg *ControllerConfig) error {
+	var setupErr error
+	watcherSetup.Do(func() {
+		if cfg.RadicaleStoragePath == "" {
+			log.Print("INFO: RADICALE_STORAGE_PATH not set. Filesystem watcher disabled.")
+			setupErr = fmt.Errorf("storage path not configured") // Prevent watcher creation
+			return
+		}
+
+		absStoragePath, err := filepath.Abs(cfg.RadicaleStoragePath)
+		if err != nil {
+			log.Printf("ERROR: Failed to get absolute path for watcher '%s': %v", cfg.RadicaleStoragePath, err)
+			setupErr = err
+			return
+		}
+
+		if _, err := os.Stat(absStoragePath); os.IsNotExist(err) {
+			log.Printf("ERROR: Watcher cannot start, storage path '%s' does not exist.", absStoragePath)
+			setupErr = err
+			return
+		}
+
+		watcher, setupErr = fsnotify.NewWatcher()
+		if setupErr != nil {
+			log.Printf("ERROR: Failed to create filesystem watcher: %v", setupErr)
+			return
+		}
+
+		go func() {
+			defer watcher.Close() // Ensure watcher is closed on exit
+			log.Printf("Filesystem watcher started for: %s", absStoragePath)
+			for {
+				select {
+				case event, ok := <-watcher.Events:
+					if !ok {
+						log.Print("WARN: Filesystem watcher channel closed.")
+						return
+					}
+					// We only care about new directories being created directly under storagePath
+					if event.Op == fsnotify.Create {
+						fileInfo, err := os.Stat(event.Name)
+						// Check if it's a directory and directly under storagePath
+						if err == nil && fileInfo.IsDir() && filepath.Dir(event.Name) == absStoragePath {
+							newUserDir := filepath.Base(event.Name)
+							log.Printf("Watcher detected new directory: %s", newUserDir)
+							// Trigger immediate symlink application for this specific new user
+							applySymlinksToUser(newUserDir, lastKnownSymlinks, absStoragePath)
+						}
+					}
+				case err, ok := <-watcher.Errors:
+					if !ok {
+						log.Print("WARN: Filesystem watcher error channel closed.")
+						return
+					}
+					log.Printf("ERROR: Filesystem watcher error: %v", err)
+				}
+			}
+		}()
+
+		setupErr = watcher.Add(absStoragePath)
+		if setupErr != nil {
+			log.Printf("ERROR: Failed to add path '%s' to watcher: %v", absStoragePath, setupErr)
+			watcher.Close() // Close watcher if adding path failed
+		}
+	})
+	return setupErr
+}
+
+// This function applies the known rules specifically to a single new user directory.
+// It's called by the watcher.
+func applySymlinksToUser(newUser string, rules []Symlink, storagePath string) {
+	watcherMutex.Lock() // Basic lock to prevent concurrent filesystem ops if needed
+	defer watcherMutex.Unlock()
+
+	log.Printf("Applying symlink rules immediately to new user: %s", newUser)
+	userPath := filepath.Join(storagePath, newUser)
+	actionsTaken := 0
+
+	for _, rule := range rules {
+		cleanedSource := filepath.Clean(rule.Source)
+		sourcePath := filepath.Join(storagePath, cleanedSource)
+		linkName := filepath.Base(sourcePath)
+		sourceOwner := strings.Split(cleanedSource, string(filepath.Separator))[0]
+
+		if newUser == sourceOwner {
+			continue // Skip creating symlink for the owner of the source
+		}
+
+		userPattern, err := regexp.Compile(rule.User)
+		if err != nil {
+			// Error already logged during full reconciliation, maybe skip logging here
+			continue
+		}
+
+		if userPattern.MatchString(newUser) {
+			linkPath := filepath.Join(userPath, linkName)
+
+			// Check if source exists before creating link
+			if _, err := os.Stat(sourcePath); err != nil {
+				// Source might not exist yet, or permissions issue. Full reconciliation will handle it later.
+				log.Printf("INFO: Source '%s' not found or inaccessible during immediate symlink for user '%s'. Skipping.", sourcePath, newUser)
+				continue
+			}
+
+			// Check if something already exists at link path (unlikely for new user, but possible)
+			if _, err := os.Lstat(linkPath); err == nil {
+				log.Printf("WARN: Path '%s' already exists for new user '%s'. Skipping immediate symlink creation.", linkPath, newUser)
+				continue
+			}
+
+			if err := os.Symlink(sourcePath, linkPath); err != nil {
+				log.Printf("ERROR: Failed to create immediate symlink '%s' -> '%s': %v", linkPath, sourcePath, err)
+			} else {
+				log.Printf("CREATE (Immediate): Symlink '%s' -> '%s'", linkPath, sourcePath)
+				actionsTaken++
+			}
+		}
+	}
+	if actionsTaken > 0 {
+		log.Printf("Immediate symlink application for user '%s' finished. %d actions taken.", newUser, actionsTaken)
+	} else {
+		log.Printf("Immediate symlink application for user '%s' finished. No applicable links created.", newUser)
+	}
+}
+
+func manageSymlinks(desiredSymlinks []Symlink, cfg *ControllerConfig) error {
+	// Update global state for the watcher
+	lastKnownConfig = cfg
+	lastKnownSymlinks = desiredSymlinks
+
+	// Setup watcher on first run (if not already setup or failed)
+	if watcher == nil {
+		_ = setupWatcher(cfg) // Attempt setup, ignore error here as main logic should proceed
+	}
+
+	storagePath := cfg.RadicaleStoragePath
 	if storagePath == "" {
 		log.Print(
-			"INFO: RADICALE_STORAGE_PATH not set. Skipping symlink management.",
+			"INFO: RADICALE_STORAGE_PATH not set. Skipping full symlink reconciliation.",
 		)
+		// If watcher was previously running, close it? Or let it run hoping path gets configured?
+		// For now, let's assume if path is gone, watcher should stop or not start.
+		// The setupWatcher logic handles the initial non-existence.
 		return nil
 	}
 
@@ -47,7 +196,10 @@ func manageSymlinks(desiredSymlinks []Symlink, storagePath string) error {
 		)
 	}
 
-	log.Printf("Starting symlink management in '%s'", storagePath)
+	log.Printf("Starting full symlink reconciliation in '%s'", storagePath)
+
+	watcherMutex.Lock() // Lock during full reconciliation
+	defer watcherMutex.Unlock()
 
 	desiredState := make(map[string]string)
 	actualState := make(map[string]string)
@@ -72,7 +224,14 @@ func manageSymlinks(desiredSymlinks []Symlink, storagePath string) error {
 		cleanedSource := filepath.Clean(rule.Source)
 		sourcePath := filepath.Join(storagePath, cleanedSource)
 		linkName := filepath.Base(sourcePath)
-		sourceOwner := strings.Split(cleanedSource, string(filepath.Separator))[0]
+		sourceOwner := ""
+		if strings.Contains(cleanedSource, string(filepath.Separator)) {
+			sourceOwner = strings.Split(cleanedSource, string(filepath.Separator))[0]
+		} else {
+			// Handle cases where source might be directly under storage path? Unlikely for radicale.
+			log.Printf("WARN: Source path '%s' does not seem to be within a user directory. Cannot determine owner.", cleanedSource)
+			continue
+		}
 
 		userPattern, err := regexp.Compile(rule.User)
 		if err != nil {
@@ -87,33 +246,29 @@ func manageSymlinks(desiredSymlinks []Symlink, storagePath string) error {
 
 		sourceInfo, err := os.Stat(sourcePath)
 		if err != nil {
-			log.Printf(
-				"WARN: Source path '%s' for symlink rule does not exist or cannot be accessed. Skipping rule. Error: %v",
-				sourcePath,
-				err,
-			)
+			// Logged during immediate creation attempt, maybe less verbose here?
+			// log.Printf("WARN: Source path '%s' for symlink rule does not exist or cannot be accessed during full reconciliation. Skipping rule. Error: %v", sourcePath, err)
 			continue
 		}
 		if !sourceInfo.IsDir() {
-			log.Printf(
-				"WARN: Source path '%s' is not a directory. Skipping rule.",
-				sourcePath,
-			)
+			// log.Printf("WARN: Source path '%s' is not a directory during full reconciliation. Skipping rule.", sourcePath)
 			continue
 		}
 
 		for _, user := range targetUsers {
 			if user == sourceOwner {
-				continue // Skip creating symlink for the owner of the source
+				continue
 			}
 
 			if userPattern.MatchString(user) {
 				linkPath := filepath.Join(storagePath, user, linkName)
-				if _, exists := desiredState[linkPath]; exists {
-					log.Printf(
-						"WARN: Duplicate desired symlink target '%s'. Check configuration rules.",
-						linkPath,
-					)
+				if oldSource, exists := desiredState[linkPath]; exists {
+					if oldSource != sourcePath {
+						log.Printf(
+							"WARN: Conflicting rules for symlink target '%s'. Rule for source '%s' overrides previous rule for source '%s'.",
+							linkPath, sourcePath, oldSource,
+						)
+					}
 				}
 				desiredState[linkPath] = sourcePath
 			}
@@ -121,8 +276,8 @@ func manageSymlinks(desiredSymlinks []Symlink, storagePath string) error {
 	}
 
 	log.Printf(
-		"Desired state calculated: %d symlinks across matched non-owner users.",
-		len(desiredState),
+		"Desired state calculated: %d symlinks across %d users.",
+		len(desiredState), len(targetUsers),
 	)
 
 	for _, user := range targetUsers {
@@ -141,22 +296,14 @@ func manageSymlinks(desiredSymlinks []Symlink, storagePath string) error {
 			entryPath := filepath.Join(userPath, entry.Name())
 			fileInfo, err := os.Lstat(entryPath)
 			if err != nil {
-				log.Printf(
-					"WARN: Failed to lstat '%s'. Skipping entry. Error: %v",
-					entryPath,
-					err,
-				)
+				// log.Printf("WARN: Failed to lstat '%s'. Skipping entry. Error: %v", entryPath, err)
 				continue
 			}
 
 			if fileInfo.Mode()&os.ModeSymlink != 0 {
 				target, err := os.Readlink(entryPath)
 				if err != nil {
-					log.Printf(
-						"WARN: Failed to read symlink '%s'. Skipping entry. Error: %v",
-						entryPath,
-						err,
-					)
+					// log.Printf("WARN: Failed to read symlink '%s'. Skipping entry. Error: %v", entryPath, err)
 					continue
 				}
 
@@ -189,6 +336,11 @@ func manageSymlinks(desiredSymlinks []Symlink, storagePath string) error {
 				)
 				continue
 			}
+			// Check source existence again right before linking
+			if _, err := os.Stat(desiredSourcePath); err != nil {
+				log.Printf("ERROR: Source path '%s' disappeared before creating link '%s'. Skipping.", desiredSourcePath, linkPath)
+				continue
+			}
 			if err := os.Symlink(desiredSourcePath, linkPath); err != nil {
 				log.Printf(
 					"ERROR: Failed to create symlink '%s' -> '%s': %v",
@@ -209,6 +361,11 @@ func manageSymlinks(desiredSymlinks []Symlink, storagePath string) error {
 				)
 				continue
 			}
+			// Check source existence again right before linking
+			if _, err := os.Stat(desiredSourcePath); err != nil {
+				log.Printf("ERROR: Source path '%s' disappeared before creating updated link '%s'. Skipping.", desiredSourcePath, linkPath)
+				continue
+			}
 			if err := os.Symlink(desiredSourcePath, linkPath); err != nil {
 				log.Printf(
 					"ERROR: Failed to create updated symlink '%s' -> '%s': %v",
@@ -226,19 +383,24 @@ func manageSymlinks(desiredSymlinks []Symlink, storagePath string) error {
 				actionsTaken++
 			}
 		}
+		// If exists and actualSourcePath == desiredSourcePath, do nothing.
 	}
 
 	for linkPath, actualSourcePath := range actualState {
 		if _, exists := desiredState[linkPath]; !exists {
-			// Before removing, double-check it's not a link pointing to itself
-			// which might happen if the owner check failed previously or config changed.
-			linkDir := filepath.Dir(linkPath)
-			linkBase := filepath.Base(linkPath)
-			potentialSelfSource := filepath.Join(linkDir, linkBase)
-			if actualSourcePath == potentialSelfSource {
+			linkDirUser := filepath.Base(filepath.Dir(linkPath))
+			sourceDirUser := ""
+			if strings.HasPrefix(actualSourcePath, storagePath) {
+				relPath, _ := filepath.Rel(storagePath, actualSourcePath)
+				if strings.Contains(relPath, string(filepath.Separator)) {
+					sourceDirUser = strings.Split(relPath, string(filepath.Separator))[0]
+				}
+			}
+
+			if linkDirUser == sourceDirUser {
 				log.Printf(
-					"INFO: Skipping removal of self-referential link '%s'. This might indicate a previous state or manual change.",
-					linkPath,
+					"INFO: Skipping removal of link '%s' pointing to collection owned by the same user ('%s'). This might be manually created or from a previous configuration.",
+					linkPath, linkDirUser,
 				)
 				continue
 			}
@@ -262,9 +424,9 @@ func manageSymlinks(desiredSymlinks []Symlink, storagePath string) error {
 	}
 
 	if actionsTaken > 0 {
-		log.Printf("Symlink management finished. %d actions taken.", actionsTaken)
+		log.Printf("Full symlink reconciliation finished. %d actions taken.", actionsTaken)
 	} else {
-		log.Print("Symlink management finished. No changes needed.")
+		log.Print("Full symlink reconciliation finished. No changes needed.")
 	}
 
 	return nil
