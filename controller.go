@@ -118,7 +118,7 @@ func processConfiguration(cfg *ControllerConfig) {
 		}
 	}
 
-	err = manageSymlinks(newConfig.Symlinks, cfg.RadicaleStoragePath)
+	err = manageSymlinks(newConfig.Symlinks, cfg)
 	if err != nil {
 		log.Printf("ERROR: Failed during symlink processing: %v", err)
 	}
