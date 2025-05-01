@@ -23,10 +23,7 @@ ENV HTTP_METHOD="GET"
 ENV AUTH_TYPE="none"
 ENV CONFIG_PATH="radicale"
 
-RUN addgroup -S radicalecontroller && adduser -S radicalecontroller -G radicalecontroller
 RUN mkdir -p /data
-
-USER radicalecontroller
 
 WORKDIR /data
 
