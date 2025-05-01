@@ -9,6 +9,9 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 )
 
 type RadicaleConfig struct {
@@ -17,22 +20,29 @@ type RadicaleConfig struct {
 }
 
 type ControllerConfig struct {
-	ConfigURL           string
-	PollInterval        time.Duration
-	RightsFilePath      string
-	RadicaleStoragePath string
-	HttpMethod          string
-	AuthType            string
-	AuthUsername        string
-	AuthPassword        string
-	AuthToken           string
-	ConfigPath          string
+	ConfigURL                string
+	PollInterval             time.Duration
+	RightsFilePath           string
+	RadicaleStoragePath      string
+	HttpMethod               string
+	AuthType                 string
+	AuthUsername             string
+	AuthPassword             string
+	AuthToken                string
+	ConfigPath               string
+	RightsConfigMapName      string
+	RightsConfigMapNamespace string
+	RightsConfigMapKey       string
+	IsInKubernetes           bool
+	KubeClient               *kubernetes.Clientset
 }
 
 var (
 	currentConfig *RadicaleConfig
 	httpClient    = &http.Client{Timeout: 15 * time.Second}
 )
+
+const podNamespacePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 
 func getEnv(key, fallback string) string {
 	if value, exists := os.LookupEnv(key); exists {
@@ -60,22 +70,74 @@ func getEnvDuration(key string, fallback time.Duration) time.Duration {
 	return duration
 }
 
+func detectKubernetes() (bool, *kubernetes.Clientset, string) {
+	host, port := os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT")
+	if len(host) == 0 || len(port) == 0 {
+		log.Print("INFO: KUBERNETES_SERVICE_HOST or KUBERNETES_SERVICE_PORT not set. Assuming not in Kubernetes.")
+		return false, nil, ""
+	}
+
+	tokenPath := "/var/run/secrets/kubernetes.io/serviceaccount/token"
+	if _, err := os.Stat(tokenPath); os.IsNotExist(err) {
+		log.Printf("INFO: Service account token '%s' not found. Assuming not in Kubernetes.", tokenPath)
+		return false, nil, ""
+	}
+
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		log.Printf("ERROR: Failed to get in-cluster Kubernetes config: %v", err)
+		return false, nil, ""
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Printf("ERROR: Failed to create Kubernetes clientset: %v", err)
+		return false, nil, ""
+	}
+
+	namespaceBytes, err := os.ReadFile(podNamespacePath)
+	namespace := string(namespaceBytes)
+	if err != nil {
+		log.Printf("WARN: Could not read pod namespace file '%s', defaulting namespace resolution. Error: %v", podNamespacePath, err)
+		namespace = "default" // Or leave empty and rely on env var
+	}
+	namespace = strings.TrimSpace(namespace)
+
+	log.Printf("INFO: Detected Kubernetes environment. Default namespace: '%s'", namespace)
+	return true, clientset, namespace
+}
+
 func loadConfiguration() *ControllerConfig {
+	isInK8s, k8sClient, defaultNs := detectKubernetes()
+
 	cfg := &ControllerConfig{
-		ConfigURL:           getEnv("CONFIG_URL", ""),
-		PollInterval:        getEnvDuration("POLL_INTERVAL", 5*time.Minute),
-		RightsFilePath:      getEnv("RIGHTS_FILE_PATH", "/data/rights"),
-		RadicaleStoragePath: getEnv("RADICALE_STORAGE_PATH", "/data/collections/collection-root"),
-		HttpMethod:          strings.ToUpper(getEnv("HTTP_METHOD", "GET")),
-		AuthType:            strings.ToLower(getEnv("AUTH_TYPE", "none")),
-		AuthUsername:        getEnv("AUTH_USERNAME", ""),
-		AuthPassword:        getEnv("AUTH_PASSWORD", ""),
-		AuthToken:           getEnv("AUTH_TOKEN", ""),
-		ConfigPath:          getEnv("CONFIG_PATH", "radicale"),
+		ConfigURL:                getEnv("CONFIG_URL", ""),
+		PollInterval:             getEnvDuration("POLL_INTERVAL", 5*time.Minute),
+		RightsFilePath:           getEnv("RIGHTS_FILE_PATH", "/etc/radicale/rights"),
+		RadicaleStoragePath:      getEnv("RADICALE_STORAGE_PATH", ""),
+		HttpMethod:               strings.ToUpper(getEnv("HTTP_METHOD", "GET")),
+		AuthType:                 strings.ToLower(getEnv("AUTH_TYPE", "none")),
+		AuthUsername:             getEnv("AUTH_USERNAME", ""),
+		AuthPassword:             getEnv("AUTH_PASSWORD", ""),
+		AuthToken:                getEnv("AUTH_TOKEN", ""),
+		ConfigPath:               getEnv("CONFIG_PATH", "radicale"),
+		RightsConfigMapName:      getEnv("RIGHTS_CONFIGMAP_NAME", ""),
+		RightsConfigMapNamespace: getEnv("RIGHTS_CONFIGMAP_NAMESPACE", defaultNs),
+		RightsConfigMapKey:       getEnv("RIGHTS_CONFIGMAP_KEY", "rights"),
+		IsInKubernetes:           isInK8s,
+		KubeClient:               k8sClient,
 	}
 
 	if cfg.ConfigURL == "" {
 		log.Fatal("FATAL: CONFIG_URL environment variable is not set.")
+	}
+	if cfg.IsInKubernetes && cfg.RightsConfigMapName == "" {
+		log.Print("WARN: Running in Kubernetes but RIGHTS_CONFIGMAP_NAME is not set. ConfigMap writing disabled.")
+		cfg.IsInKubernetes = false // Disable k8s features if CM name is missing
+	}
+	if cfg.IsInKubernetes && cfg.RightsConfigMapNamespace == "" {
+		log.Print("WARN: Running in Kubernetes but could not determine namespace and RIGHTS_CONFIGMAP_NAMESPACE is not set. Using 'default'.")
+		cfg.RightsConfigMapNamespace = "default"
 	}
 
 	log.Printf("--- Controller Configuration ---")
@@ -86,6 +148,12 @@ func loadConfiguration() *ControllerConfig {
 	log.Printf("HTTP Method: %s", cfg.HttpMethod)
 	log.Printf("Auth Type: %s", cfg.AuthType)
 	log.Printf("Config Path in JSON: %s", cfg.ConfigPath)
+	log.Printf("Running in Kubernetes: %t", cfg.IsInKubernetes)
+	if cfg.IsInKubernetes {
+		log.Printf("Rights ConfigMap Name: %s", cfg.RightsConfigMapName)
+		log.Printf("Rights ConfigMap Namespace: %s", cfg.RightsConfigMapNamespace)
+		log.Printf("Rights ConfigMap Key: %s", cfg.RightsConfigMapKey)
+	}
 	log.Printf("------------------------------")
 
 	return cfg
@@ -187,7 +255,6 @@ func fetchConfig(cfg *ControllerConfig) (*RadicaleConfig, error) {
 	log.Printf("Fetching configuration from %s", cfg.ConfigURL)
 
 	var reqBody io.Reader = nil
-	// Add request body handling here if needed for methods like POST
 
 	req, err := http.NewRequest(cfg.HttpMethod, cfg.ConfigURL, reqBody)
 	if err != nil {
@@ -210,7 +277,6 @@ func fetchConfig(cfg *ControllerConfig) (*RadicaleConfig, error) {
 		req.Header.Set("Authorization", "Bearer "+cfg.AuthToken)
 		log.Print("Using Bearer Token Authentication")
 	case "none":
-		// No action needed
 		log.Print("Using no authentication")
 	default:
 		log.Printf(
